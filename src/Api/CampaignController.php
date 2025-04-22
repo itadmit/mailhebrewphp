@@ -225,103 +225,80 @@ class CampaignController
      */
     public function create(Request $request, Response $response): Response
     {
-        // מזהה החשבון (בפועל יתקבל מה-authentication)
-        $accountId = 1;
-        
-        // נתוני הקמפיין החדש
-        $data = $request->getParsedBody();
-        
-        // וידוא שהנתונים הבסיסיים קיימים
-        $requiredFields = ['name', 'subject', 'from_email', 'from_name', 'content_html'];
-        
-        foreach ($requiredFields as $field) {
-            if (empty($data[$field])) {
-                return $this->jsonResponse($response, [
-                    'success' => false,
-                    'message' => "Missing required field: {$field}"
-                ], 400);
-            }
-        }
-        
+        $this->logger->info('Received campaign create request', [
+            'body' => $request->getParsedBody()
+        ]);
+
         try {
-            // יצירת אובייקט Campaign
-            $campaign = new Campaign(
-                $accountId,
-                $data['name'],
-                $data['subject'],
-                $data['from_email'],
-                $data['from_name'],
-                $data['content_html'],
-                $data['content_text'] ?? null,
-                $data['reply_to'] ?? null
-            );
+            $data = $request->getParsedBody();
             
-            // שמירה במסד הנתונים
-            $this->db->beginTransaction();
+            $this->logger->info('Validating campaign data');
             
-            $query = "
-                INSERT INTO campaigns (
-                    account_id, name, subject, from_email, from_name, reply_to,
-                    content_html, content_text, status, created_at
-                ) VALUES (
-                    :account_id, :name, :subject, :from_email, :from_name, :reply_to,
-                    :content_html, :content_text, :status, :created_at
-                )
-            ";
-            
-            $stmt = $this->db->prepare($query);
-            $stmt->bindValue(':account_id', $campaign->getAccountId(), PDO::PARAM_INT);
-            $stmt->bindValue(':name', $campaign->getName());
-            $stmt->bindValue(':subject', $campaign->getSubject());
-            $stmt->bindValue(':from_email', $campaign->getFromEmail());
-            $stmt->bindValue(':from_name', $campaign->getFromName());
-            $stmt->bindValue(':reply_to', $campaign->getReplyTo());
-            $stmt->bindValue(':content_html', $campaign->getContentHtml());
-            $stmt->bindValue(':content_text', $campaign->getContentText());
-            $stmt->bindValue(':status', $campaign->getStatus());
-            $stmt->bindValue(':created_at', $campaign->getCreatedAt()->format('Y-m-d H:i:s'));
-            $stmt->execute();
-            
-            $campaignId = (int)$this->db->lastInsertId();
-            $campaign->setId($campaignId);
-            
-            // הוספת רשימות אם יש
-            if (!empty($data['lists']) && is_array($data['lists'])) {
-                $insertListQuery = "
-                    INSERT INTO campaign_lists (campaign_id, list_id)
-                    VALUES (:campaign_id, :list_id)
-                ";
-                
-                $insertListStmt = $this->db->prepare($insertListQuery);
-                
-                foreach ($data['lists'] as $listId) {
-                    $insertListStmt->bindValue(':campaign_id', $campaignId, PDO::PARAM_INT);
-                    $insertListStmt->bindValue(':list_id', $listId, PDO::PARAM_INT);
-                    $insertListStmt->execute();
-                    
-                    $campaign->addList($listId);
-                }
+            // בדיקת שדות חובה
+            if (empty($data['name'])) {
+                $this->logger->error('Missing required field: name');
+                return $this->jsonResponse($response, ['error' => 'Missing required field: name'], 400);
             }
+
+            if (empty($data['subject'])) {
+                $this->logger->error('Missing required field: subject');
+                return $this->jsonResponse($response, ['error' => 'Missing required field: subject'], 400);
+            }
+
+            if (empty($data['content_html']) && empty($data['content_text'])) {
+                $this->logger->error('Missing required field: content_html or content_text');
+                return $this->jsonResponse($response, ['error' => 'Missing required field: content_html or content_text'], 400);
+            }
+
+            if (empty($data['list_id'])) {
+                $this->logger->error('Missing required field: list_id');
+                return $this->jsonResponse($response, ['error' => 'Missing required field: list_id'], 400);
+            }
+
+            $this->logger->info('Creating campaign object');
             
-            $this->db->commit();
-            
-            return $this->jsonResponse($response, [
-                'success' => true,
-                'data' => $campaign->toArray(),
-                'message' => 'Campaign created successfully'
-            ], 201);
-        } catch (\Throwable $e) {
-            $this->db->rollBack();
-            
-            $this->logger->error('Error creating campaign', [
-                'exception' => $e->getMessage(),
-                'data' => $data
+            // יצירת אובייקט קמפיין
+            $campaign = new Campaign();
+            $campaign->setName($data['name']);
+            $campaign->setSubject($data['subject']);
+            $campaign->setContentHtml($data['content_html'] ?? '');
+            $campaign->setContentText($data['content_text'] ?? '');
+            $campaign->setListId($data['list_id']);
+            $campaign->setFromEmail($data['from_email'] ?? 'no-reply@quick-site.co.il');
+            $campaign->setFromName($data['from_name'] ?? 'MailHebrew System');
+            $campaign->setReplyTo($data['reply_to'] ?? null);
+            $campaign->setTrackingEnabled($data['tracking_enabled'] ?? true);
+            $campaign->setScheduledAt($data['scheduled_at'] ?? null);
+
+            $this->logger->info('Campaign object created', [
+                'name' => $campaign->getName(),
+                'subject' => $campaign->getSubject(),
+                'list_id' => $campaign->getListId()
             ]);
-            
-            return $this->jsonResponse($response, [
-                'success' => false,
-                'message' => 'Failed to create campaign: ' . $e->getMessage()
-            ], 500);
+
+            // שמירת הקמפיין במסד הנתונים
+            $this->logger->info('Saving campaign to database');
+            $result = $this->campaignRepository->save($campaign);
+
+            if ($result) {
+                $this->logger->info('Campaign saved successfully', [
+                    'campaign_id' => $campaign->getId()
+                ]);
+                return $this->jsonResponse($response, [
+                    'message' => 'Campaign created successfully',
+                    'campaign_id' => $campaign->getId()
+                ]);
+            } else {
+                $this->logger->error('Failed to save campaign');
+                return $this->jsonResponse($response, ['error' => 'Failed to create campaign'], 500);
+            }
+
+        } catch (\Exception $e) {
+            $this->logger->error('Exception while processing campaign request', [
+                'error' => $e->getMessage(),
+                'trace' => $e->getTraceAsString()
+            ]);
+            return $this->jsonResponse($response, ['error' => 'Internal server error'], 500);
         }
     }
     
