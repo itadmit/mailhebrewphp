@@ -14,6 +14,7 @@ use Psr\Http\Message\ResponseInterface as Response;
 use Psr\Http\Message\ServerRequestInterface as Request;
 use Slim\Factory\AppFactory;
 use Slim\Exception\HttpNotFoundException;
+use Psr\Log\LoggerInterface;
 
 require __DIR__ . '/../vendor/autoload.php';
 
@@ -128,6 +129,78 @@ $containerBuilder->addDefinitions([
         
         return $redis;
     },
+    'queueConfig' => function (ContainerInterface $c) {
+        return $c->get('settings')['queue'];
+    },
+    \MailHebrew\Infrastructure\Queue\QueueManager::class => function (ContainerInterface $c) {
+        $redis = $c->get('redis');
+        $logger = $c->get('logger');
+        $queueConfig = $c->get('queueConfig');
+        
+        return new \MailHebrew\Infrastructure\Queue\QueueManager(
+            $redis,
+            $logger,
+            $queueConfig
+        );
+    },
+    \MailHebrew\Api\EmailController::class => function (ContainerInterface $c) {
+        $queueManager = $c->get(\MailHebrew\Infrastructure\Queue\QueueManager::class);
+        $logger = $c->get('logger');
+        $db = $c->get('db');
+        $emailSender = $c->get(\MailHebrew\Infrastructure\Mail\EmailSender::class);
+        
+        return new \MailHebrew\Api\EmailController(
+            $queueManager,
+            $logger,
+            $db,
+            $emailSender
+        );
+    },
+    \MailHebrew\Api\CampaignController::class => function (ContainerInterface $c) {
+        $queueManager = $c->get(\MailHebrew\Infrastructure\Queue\QueueManager::class);
+        $logger = $c->get('logger');
+        $db = $c->get('db');
+        
+        return new \MailHebrew\Api\CampaignController(
+            $queueManager,
+            $logger,
+            $db
+        );
+    },
+    \MailHebrew\Infrastructure\Tracking\TrackingManager::class => function (ContainerInterface $c) {
+        $settings = $c->get('settings');
+        $logger = $c->get('logger');
+        
+        return new \MailHebrew\Infrastructure\Tracking\TrackingManager(
+            $settings['app']['tracking_domain'],
+            $settings['app']['url'],
+            $logger
+        );
+    },
+    \MailHebrew\Infrastructure\Mail\EmailSender::class => function (ContainerInterface $c) {
+        $smtpConfig = $c->get('settings')['smtp'];
+        $logger = $c->get('logger');
+        $trackingManager = $c->get(\MailHebrew\Infrastructure\Tracking\TrackingManager::class);
+        
+        return new \MailHebrew\Infrastructure\Mail\EmailSender(
+            $smtpConfig,
+            $logger,
+            $trackingManager
+        );
+    },
+    TrackingController::class => function (ContainerInterface $c) {
+        return new TrackingController(
+            $c->get(\MailHebrew\Infrastructure\Tracking\TrackingManager::class),
+            $c->get(LoggerInterface::class),
+            $c->get('db')
+        );
+    },
+    TrackingManager::class => function (ContainerInterface $c) {
+        return new TrackingManager(
+            $c->get('settings')['app']['url'],
+            $c->get('logger')
+        );
+    },
 ]);
 
 // Create container
@@ -157,6 +230,11 @@ $app->get('/', function (Request $request, Response $response) {
 
 // Add API Routes
 require __DIR__ . '/../src/Api/routes.php';
+
+// נתיבי מעקב
+$app->get('/track/open/{id}', [TrackingController::class, 'trackOpen']);
+$app->get('/track/click/{id}', [TrackingController::class, 'trackClick']);
+$app->get('/unsubscribe/{id}', [TrackingController::class, 'unsubscribe']);
 
 // Run app
 $app->run(); 

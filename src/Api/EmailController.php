@@ -12,21 +12,25 @@ use Psr\Http\Message\ServerRequestInterface as Request;
 use Psr\Log\LoggerInterface;
 use PDO;
 use Respect\Validation\Validator as v;
+use MailHebrew\Domain\Email\EmailSender;
 
 class EmailController
 {
     private QueueManager $queueManager;
     private LoggerInterface $logger;
     private PDO $db;
+    private EmailSender $emailSender;
 
     public function __construct(
         QueueManager $queueManager,
         LoggerInterface $logger,
-        PDO $db
+        PDO $db,
+        EmailSender $emailSender
     ) {
         $this->queueManager = $queueManager;
         $this->logger = $logger;
         $this->db = $db;
+        $this->emailSender = $emailSender;
     }
 
     /**
@@ -50,84 +54,39 @@ class EmailController
             
             // יצירת אובייקט אימייל
             $email = new Email(
-                $data['from']['email'],
-                $data['from']['name'],
-                $data['to'],
+                $data['from_email'],
+                $data['from_name'],
+                $data['to_email'],
+                $data['to_name'] ?? null,
                 $data['subject'],
-                $data['html_body'] ?? '',
-                $data['text_body'] ?? ''
+                $data['content_html'] ?? null,
+                $data['content_text'] ?? null,
+                $data['reply_to'] ?? null,
+                $data['tracking_enabled'] ?? true
             );
             
-            // הגדרת שדות אופציונליים
-            if (isset($data['cc'])) {
-                $email->setCc($data['cc']);
-            }
-            
-            if (isset($data['bcc'])) {
-                $email->setBcc($data['bcc']);
-            }
-            
-            if (isset($data['track_opens'])) {
-                $email->setTrackOpens((bool)$data['track_opens']);
-            }
-            
-            if (isset($data['track_clicks'])) {
-                $email->setTrackClicks((bool)$data['track_clicks']);
-            }
-            
-            if (isset($data['tags']) && is_array($data['tags'])) {
-                foreach ($data['tags'] as $tag) {
-                    $email->addTag($tag);
-                }
-            }
-            
-            if (isset($data['metadata']) && is_array($data['metadata'])) {
-                $email->setMetadata($data['metadata']);
-            }
-            
-            // טיפול בתזמון אם קיים
-            if (isset($data['scheduled_at']) && !empty($data['scheduled_at'])) {
-                $scheduledAt = new DateTimeImmutable($data['scheduled_at']);
-                $email->schedule($scheduledAt);
-            }
-            
-            // שמירת האימייל במסד הנתונים
+            // שמירה למסד הנתונים
             $this->saveEmailToDatabase($email, $accountId);
             
-            // הוספת האימייל לתור עם עדיפות מתאימה
-            $priority = $data['priority'] ?? 'normal';
-            $result = $this->queueManager->enqueue($email, $priority);
+            // הוספה לתור
+            $this->queueManager->enqueue($email);
             
-            if (!$result) {
-                throw new \RuntimeException('Failed to enqueue email');
-            }
-            
-            // החזרת תשובה
-            $responseData = [
+            return $this->jsonResponse($response, [
                 'success' => true,
                 'message' => 'Email queued successfully',
-                'data' => [
-                    'email_id' => $email->getId(),
-                    'status' => $email->getStatus(),
-                ],
-            ];
+                'email_id' => $email->getId(),
+            ]);
             
-            // אם זה קמפיין, נעדכן את סטטוס הקמפיין
-            if (isset($data['campaign_id'])) {
-                $this->updateCampaignStatus((int)$data['campaign_id']);
-                $responseData['data']['campaign_id'] = (int)$data['campaign_id'];
-            }
-            
-            return $this->jsonResponse($response, $responseData);
-        } catch (\Throwable $e) {
-            $this->logger->error('Error sending email', [
-                'exception' => $e->getMessage(),
+        } catch (\Exception $e) {
+            $this->logger->error('Failed to queue email', [
+                'error' => $e->getMessage(),
                 'trace' => $e->getTraceAsString(),
             ]);
             
             return $this->jsonResponse($response, [
                 'success' => false,
-                'message' => 'Failed to send email: ' . $e->getMessage(),
+                'message' => 'Failed to queue email',
+                'error' => $e->getMessage(),
             ], 500);
         }
     }
@@ -139,120 +98,83 @@ class EmailController
     {
         $data = $request->getParsedBody();
         
-        if (!isset($data['emails']) || !is_array($data['emails'])) {
+        // וידוא שדות חובה
+        if (!isset($data['emails']) || !is_array($data['emails']) || empty($data['emails'])) {
             return $this->jsonResponse($response, [
                 'success' => false,
-                'message' => 'Missing emails array',
+                'message' => 'Emails array is required',
             ], 400);
         }
         
-        $results = [];
-        $totalSuccess = 0;
-        $totalFailed = 0;
-        
-        // מזהה החשבון (בפועל יתקבל מה-authentication)
-        $accountId = $data['account_id'] ?? 1;
-        
-        foreach ($data['emails'] as $emailData) {
-            try {
-                // וידוא שדות חובה
-                if (!$this->validateRequiredEmailFields($emailData)) {
-                    $results[] = [
-                        'success' => false,
-                        'message' => 'Missing required fields',
+        try {
+            // מזהה החשבון (בפועל יתקבל מה-authentication)
+            $accountId = $data['account_id'] ?? 1;
+            
+            $results = [
+                'success' => [],
+                'failed' => [],
+            ];
+            
+            foreach ($data['emails'] as $emailData) {
+                try {
+                    // וידוא שדות חובה לכל אימייל
+                    if (!$this->validateRequiredEmailFields($emailData)) {
+                        $results['failed'][] = [
+                            'error' => 'Missing required fields',
+                            'data' => $emailData,
+                        ];
+                        continue;
+                    }
+                    
+                    // יצירת אובייקט אימייל
+                    $email = new Email(
+                        $emailData['from_email'],
+                        $emailData['from_name'],
+                        $emailData['to_email'],
+                        $emailData['to_name'] ?? null,
+                        $emailData['subject'],
+                        $emailData['content_html'] ?? null,
+                        $emailData['content_text'] ?? null,
+                        $emailData['reply_to'] ?? null,
+                        $emailData['tracking_enabled'] ?? true
+                    );
+                    
+                    // שמירה למסד הנתונים
+                    $this->saveEmailToDatabase($email, $accountId);
+                    
+                    // הוספה לתור
+                    $this->queueManager->enqueue($email);
+                    
+                    $results['success'][] = [
+                        'email_id' => $email->getId(),
+                    ];
+                    
+                } catch (\Exception $e) {
+                    $results['failed'][] = [
+                        'error' => $e->getMessage(),
                         'data' => $emailData,
                     ];
-                    $totalFailed++;
-                    continue;
                 }
-                
-                // יצירת אובייקט אימייל
-                $email = new Email(
-                    $emailData['from']['email'],
-                    $emailData['from']['name'],
-                    $emailData['to'],
-                    $emailData['subject'],
-                    $emailData['html_body'] ?? '',
-                    $emailData['text_body'] ?? ''
-                );
-                
-                // הגדרת שדות אופציונליים
-                if (isset($emailData['cc'])) {
-                    $email->setCc($emailData['cc']);
-                }
-                
-                if (isset($emailData['bcc'])) {
-                    $email->setBcc($emailData['bcc']);
-                }
-                
-                if (isset($emailData['track_opens'])) {
-                    $email->setTrackOpens((bool)$emailData['track_opens']);
-                }
-                
-                if (isset($emailData['track_clicks'])) {
-                    $email->setTrackClicks((bool)$emailData['track_clicks']);
-                }
-                
-                if (isset($emailData['tags']) && is_array($emailData['tags'])) {
-                    foreach ($emailData['tags'] as $tag) {
-                        $email->addTag($tag);
-                    }
-                }
-                
-                if (isset($emailData['metadata']) && is_array($emailData['metadata'])) {
-                    $email->setMetadata($emailData['metadata']);
-                }
-                
-                // טיפול בתזמון אם קיים
-                if (isset($emailData['scheduled_at']) && !empty($emailData['scheduled_at'])) {
-                    $scheduledAt = new DateTimeImmutable($emailData['scheduled_at']);
-                    $email->schedule($scheduledAt);
-                }
-                
-                // שמירת האימייל במסד הנתונים
-                $this->saveEmailToDatabase($email, $accountId);
-                
-                // הוספת האימייל לתור עם עדיפות מתאימה
-                $priority = $emailData['priority'] ?? 'normal';
-                $result = $this->queueManager->enqueue($email, $priority);
-                
-                if (!$result) {
-                    throw new \RuntimeException('Failed to enqueue email');
-                }
-                
-                // תוצאות חיוביות
-                $results[] = [
-                    'success' => true,
-                    'email_id' => $email->getId(),
-                    'status' => $email->getStatus(),
-                ];
-                
-                $totalSuccess++;
-                
-                // אם זה קמפיין, נעדכן את סטטוס הקמפיין
-                if (isset($emailData['campaign_id'])) {
-                    $this->updateCampaignStatus((int)$emailData['campaign_id']);
-                }
-            } catch (\Throwable $e) {
-                $this->logger->error('Error in batch email', [
-                    'exception' => $e->getMessage(),
-                ]);
-                
-                $results[] = [
-                    'success' => false,
-                    'message' => $e->getMessage(),
-                    'data' => $emailData,
-                ];
-                
-                $totalFailed++;
             }
+            
+            return $this->jsonResponse($response, [
+                'success' => true,
+                'message' => 'Batch processing completed',
+                'results' => $results,
+            ]);
+            
+        } catch (\Exception $e) {
+            $this->logger->error('Failed to process batch emails', [
+                'error' => $e->getMessage(),
+                'trace' => $e->getTraceAsString(),
+            ]);
+            
+            return $this->jsonResponse($response, [
+                'success' => false,
+                'message' => 'Failed to process batch emails',
+                'error' => $e->getMessage(),
+            ], 500);
         }
-        
-        return $this->jsonResponse($response, [
-            'success' => $totalFailed === 0,
-            'message' => "Processed {$totalSuccess} emails successfully, {$totalFailed} failed",
-            'results' => $results,
-        ]);
     }
 
     /**
@@ -260,7 +182,7 @@ class EmailController
      */
     public function getStatus(Request $request, Response $response, array $args): Response
     {
-        $emailId = $args['id'];
+        $emailId = $args['id'] ?? '';
         
         if (empty($emailId)) {
             return $this->jsonResponse($response, [
@@ -270,13 +192,13 @@ class EmailController
         }
         
         try {
-            // קבלת סטטוס האימייל ממסד הנתונים
             $stmt = $this->db->prepare("
-                SELECT 
-                    id, status, sent_at, opened_at, clicked_at, 
-                    created_at, updated_at, campaign_id
-                FROM emails 
-                WHERE id = :id
+                SELECT e.*, 
+                       COUNT(DISTINCT ev.id) as event_count
+                FROM emails e
+                LEFT JOIN email_events ev ON e.id = ev.email_id
+                WHERE e.id = :id
+                GROUP BY e.id
             ");
             
             $stmt->execute(['id' => $emailId]);
@@ -289,33 +211,28 @@ class EmailController
                 ], 404);
             }
             
-            // קבלת אירועים קשורים
-            $stmt = $this->db->prepare("
-                SELECT event_type, created_at, ip_address
-                FROM email_events
-                WHERE email_id = :email_id
-                ORDER BY created_at DESC
-            ");
-            
-            $stmt->execute(['email_id' => $emailId]);
-            $events = $stmt->fetchAll();
-            
             return $this->jsonResponse($response, [
                 'success' => true,
                 'data' => [
-                    'email' => $email,
-                    'events' => $events,
+                    'id' => $email['id'],
+                    'status' => $email['status'],
+                    'sent_at' => $email['sent_at'],
+                    'opened_at' => $email['opened_at'],
+                    'clicked_at' => $email['clicked_at'],
+                    'event_count' => (int)$email['event_count'],
                 ],
             ]);
-        } catch (\Throwable $e) {
-            $this->logger->error('Error getting email status', [
-                'exception' => $e->getMessage(),
-                'email_id' => $emailId,
+            
+        } catch (\Exception $e) {
+            $this->logger->error('Failed to get email status', [
+                'error' => $e->getMessage(),
+                'trace' => $e->getTraceAsString(),
             ]);
             
             return $this->jsonResponse($response, [
                 'success' => false,
-                'message' => 'Failed to get email status: ' . $e->getMessage(),
+                'message' => 'Failed to get email status',
+                'error' => $e->getMessage(),
             ], 500);
         }
     }
@@ -327,91 +244,50 @@ class EmailController
     {
         $data = $request->getParsedBody();
         
-        if (!isset($data['to']) || empty($data['to'])) {
+        // וידוא שדות חובה
+        if (!$this->validateRequiredEmailFields($data)) {
             return $this->jsonResponse($response, [
                 'success' => false,
-                'message' => 'Recipient email is required',
+                'message' => 'Missing required fields',
             ], 400);
         }
         
         try {
-            // מזהה החשבון (בפועל יתקבל מה-authentication)
-            $accountId = $data['account_id'] ?? 1;
-            
-            // בדיקה אם מדובר בבדיקת תבנית
-            if (isset($data['template_id'])) {
-                // קבלת התבנית ממסד הנתונים
-                $stmt = $this->db->prepare("
-                    SELECT content_html, content_text
-                    FROM templates
-                    WHERE id = :id AND account_id = :account_id
-                ");
-                
-                $stmt->execute([
-                    'id' => $data['template_id'],
-                    'account_id' => $accountId,
-                ]);
-                
-                $template = $stmt->fetch();
-                
-                if (!$template) {
-                    return $this->jsonResponse($response, [
-                        'success' => false,
-                        'message' => 'Template not found',
-                    ], 404);
-                }
-                
-                // החלפת משתנים בתבנית
-                $htmlBody = $template['content_html'];
-                $textBody = $template['content_text'];
-                
-                if (isset($data['variables']) && is_array($data['variables'])) {
-                    foreach ($data['variables'] as $key => $value) {
-                        $htmlBody = str_replace('{{' . $key . '}}', $value, $htmlBody);
-                        $textBody = str_replace('{{' . $key . '}}', $value, $textBody);
-                    }
-                }
-            } else {
-                // שימוש בתוכן ישיר
-                $htmlBody = $data['html_body'] ?? '';
-                $textBody = $data['text_body'] ?? '';
-            }
-            
             // יצירת אובייקט אימייל
             $email = new Email(
-                $data['from']['email'] ?? $_ENV['SMTP_FROM_EMAIL'],
-                $data['from']['name'] ?? $_ENV['SMTP_FROM_NAME'],
-                is_array($data['to']) ? $data['to'] : [$data['to']],
-                $data['subject'] ?? 'Test Email',
-                $htmlBody,
-                $textBody
+                $data['from_email'],
+                $data['from_name'],
+                $data['to_email'],
+                $data['to_name'] ?? null,
+                $data['subject'],
+                $data['content_html'] ?? null,
+                $data['content_text'] ?? null,
+                $data['reply_to'] ?? null,
+                $data['tracking_enabled'] ?? true
             );
             
-            // תיוג כאימייל בדיקה
-            $email->addTag('test');
+            // שליחה מיידית
+            $success = $this->emailSender->send($email);
             
-            // שליחת האימייל בעדיפות גבוהה
-            $result = $this->queueManager->enqueue($email, 'high');
-            
-            if (!$result) {
-                throw new \RuntimeException('Failed to enqueue test email');
+            if (!$success) {
+                throw new \RuntimeException('Failed to send test email');
             }
             
             return $this->jsonResponse($response, [
                 'success' => true,
-                'message' => 'Test email queued successfully',
-                'data' => [
-                    'email_id' => $email->getId(),
-                ],
+                'message' => 'Test email sent successfully',
             ]);
-        } catch (\Throwable $e) {
-            $this->logger->error('Error sending test email', [
-                'exception' => $e->getMessage(),
+            
+        } catch (\Exception $e) {
+            $this->logger->error('Failed to send test email', [
+                'error' => $e->getMessage(),
+                'trace' => $e->getTraceAsString(),
             ]);
             
             return $this->jsonResponse($response, [
                 'success' => false,
-                'message' => 'Failed to send test email: ' . $e->getMessage(),
+                'message' => 'Failed to send test email',
+                'error' => $e->getMessage(),
             ], 500);
         }
     }
@@ -421,12 +297,21 @@ class EmailController
      */
     private function validateRequiredEmailFields(array $data): bool
     {
-        return isset($data['from']) && is_array($data['from']) && 
-               isset($data['from']['email']) && 
-               isset($data['from']['name']) && 
-               isset($data['to']) && 
-               isset($data['subject']) && 
-               (isset($data['html_body']) || isset($data['text_body']));
+        $requiredFields = [
+            'from_email',
+            'from_name',
+            'to_email',
+            'subject',
+            'content_html',
+        ];
+        
+        foreach ($requiredFields as $field) {
+            if (!isset($data[$field]) || empty($data[$field])) {
+                return false;
+            }
+        }
+        
+        return true;
     }
 
     /**
@@ -434,82 +319,33 @@ class EmailController
      */
     private function saveEmailToDatabase(Email $email, int $accountId): void
     {
-        try {
-            $this->db->beginTransaction();
-            
-            foreach ($email->getTo() as $recipient) {
-                $recipientEmail = is_array($recipient) ? $recipient['email'] : $recipient;
-                $recipientName = is_array($recipient) ? ($recipient['name'] ?? '') : '';
-                
-                // בדיקה אם הנמען כבר קיים במסד הנתונים
-                $stmt = $this->db->prepare("
-                    SELECT id 
-                    FROM recipients 
-                    WHERE account_id = :account_id AND email = :email
-                ");
-                
-                $stmt->execute([
-                    'account_id' => $accountId,
-                    'email' => $recipientEmail,
-                ]);
-                
-                $recipientId = $stmt->fetchColumn();
-                
-                // אם הנמען לא קיים, נוסיף אותו
-                if (!$recipientId) {
-                    $stmt = $this->db->prepare("
-                        INSERT INTO recipients (account_id, email, name, is_active)
-                        VALUES (:account_id, :email, :name, 1)
-                    ");
-                    
-                    $stmt->execute([
-                        'account_id' => $accountId,
-                        'email' => $recipientEmail,
-                        'name' => $recipientName,
-                    ]);
-                    
-                    $recipientId = $this->db->lastInsertId();
-                }
-                
-                // הוספת האימייל לטבלת האימיילים
-                $stmt = $this->db->prepare("
-                    INSERT INTO emails (
-                        id, campaign_id, account_id, recipient_id, 
-                        from_email, from_name, to_email, to_name, 
-                        subject, content_html, content_text, status,
-                        tracking_enabled, metadata
-                    )
-                    VALUES (
-                        :id, :campaign_id, :account_id, :recipient_id,
-                        :from_email, :from_name, :to_email, :to_name,
-                        :subject, :content_html, :content_text, :status,
-                        :tracking_enabled, :metadata
-                    )
-                ");
-                
-                $stmt->execute([
-                    'id' => $email->getId(),
-                    'campaign_id' => $email->getCampaignId(),
-                    'account_id' => $accountId,
-                    'recipient_id' => $recipientId,
-                    'from_email' => $email->getFrom(),
-                    'from_name' => $email->getFromName(),
-                    'to_email' => $recipientEmail,
-                    'to_name' => $recipientName,
-                    'subject' => $email->getSubject(),
-                    'content_html' => $email->getHtmlBody(),
-                    'content_text' => $email->getTextBody(),
-                    'status' => $email->getStatus(),
-                    'tracking_enabled' => (int)($email->isTrackOpens() || $email->isTrackClicks()),
-                    'metadata' => !empty($email->getMetadata()) ? json_encode($email->getMetadata()) : null,
-                ]);
-            }
-            
-            $this->db->commit();
-        } catch (\Throwable $e) {
-            $this->db->rollBack();
-            throw $e;
-        }
+        $stmt = $this->db->prepare("
+            INSERT INTO emails (
+                id, account_id, from_email, from_name, to_email, to_name,
+                subject, content_html, content_text, reply_to, tracking_enabled,
+                status, created_at
+            ) VALUES (
+                :id, :account_id, :from_email, :from_name, :to_email, :to_name,
+                :subject, :content_html, :content_text, :reply_to, :tracking_enabled,
+                :status, :created_at
+            )
+        ");
+        
+        $stmt->execute([
+            'id' => $email->getId(),
+            'account_id' => $accountId,
+            'from_email' => $email->getFrom(),
+            'from_name' => $email->getFromName(),
+            'to_email' => $email->getTo(),
+            'to_name' => $email->getToName(),
+            'subject' => $email->getSubject(),
+            'content_html' => $email->getContentHtml(),
+            'content_text' => $email->getContentText(),
+            'reply_to' => $email->getReplyTo(),
+            'tracking_enabled' => $email->isTrackingEnabled(),
+            'status' => $email->getStatus(),
+            'created_at' => (new DateTimeImmutable())->format('Y-m-d H:i:s'),
+        ]);
     }
 
     /**
@@ -538,10 +374,7 @@ class EmailController
      */
     private function jsonResponse(Response $response, array $data, int $status = 200): Response
     {
-        $payload = json_encode($data);
-        
-        $response->getBody()->write($payload);
-        
+        $response->getBody()->write(json_encode($data, JSON_UNESCAPED_UNICODE));
         return $response
             ->withHeader('Content-Type', 'application/json')
             ->withStatus($status);

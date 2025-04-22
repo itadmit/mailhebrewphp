@@ -9,6 +9,7 @@ use Psr\Http\Message\ResponseInterface as Response;
 use Psr\Http\Message\ServerRequestInterface as Request;
 use Psr\Log\LoggerInterface;
 use PDO;
+use Exception;
 
 class TrackingController
 {
@@ -33,32 +34,18 @@ class TrackingController
     {
         $emailId = $args['id'] ?? '';
         
-        if (empty($emailId)) {
-            return $this->pixelResponse($response);
-        }
-        
         try {
-            // קבלת פרטי בקשה
-            $ipAddress = $request->getServerParams()['REMOTE_ADDR'] ?? '';
-            $userAgent = $request->getHeaderLine('User-Agent');
+            $this->trackingManager->trackOpen($emailId);
             
-            // רישום הפתיחה כאירוע למסד הנתונים
-            $this->recordOpenEvent($emailId, $ipAddress, $userAgent);
-            
-            // רישום למערכת המעקב
-            $this->trackingManager->recordOpen($emailId, [
-                'ip' => $ipAddress,
-                'user_agent' => $userAgent,
-            ]);
-        } catch (\Throwable $e) {
-            $this->logger->error('Error tracking email open', [
+            return $this->pixelResponse($response);
+        } catch (Exception $e) {
+            $this->logger->error('Failed to track email open', [
                 'email_id' => $emailId,
-                'exception' => $e->getMessage(),
+                'error' => $e->getMessage()
             ]);
+            
+            return $response->withStatus(500);
         }
-        
-        // החזרת פיקסל שקוף ב-PNG
-        return $this->pixelResponse($response);
     }
 
     /**
@@ -67,42 +54,26 @@ class TrackingController
     public function trackClick(Request $request, Response $response, array $args): Response
     {
         $emailId = $args['id'] ?? '';
+        $url = $request->getQueryParams()['url'] ?? '';
         
-        if (empty($emailId)) {
-            return $this->notFoundResponse($response);
+        if (empty($url)) {
+            return $response->withStatus(400);
         }
         
         try {
-            // פרטי הבקשה
-            $params = $request->getQueryParams();
-            $url = $params['url'] ?? '';
-            $ipAddress = $request->getServerParams()['REMOTE_ADDR'] ?? '';
-            $userAgent = $request->getHeaderLine('User-Agent');
+            $this->trackingManager->trackClick($emailId, $url);
             
-            if (empty($url)) {
-                return $this->notFoundResponse($response);
-            }
-            
-            // רישום הלחיצה כאירוע למסד הנתונים
-            $this->recordClickEvent($emailId, $url, $ipAddress, $userAgent);
-            
-            // רישום למערכת המעקב
-            $this->trackingManager->recordClick($emailId, $url, [
-                'ip' => $ipAddress,
-                'user_agent' => $userAgent,
-            ]);
-            
-            // הפניה ליעד המקורי
             return $response
                 ->withHeader('Location', $url)
                 ->withStatus(302);
-        } catch (\Throwable $e) {
-            $this->logger->error('Error tracking email click', [
+        } catch (Exception $e) {
+            $this->logger->error('Failed to track email click', [
                 'email_id' => $emailId,
-                'exception' => $e->getMessage(),
+                'url' => $url,
+                'error' => $e->getMessage()
             ]);
             
-            return $this->notFoundResponse($response);
+            return $response->withStatus(500);
         }
     }
 
