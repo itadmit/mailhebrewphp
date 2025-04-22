@@ -5,12 +5,13 @@ declare(strict_types=1);
 namespace MailHebrew\Infrastructure\Mail;
 
 use MailHebrew\Domain\Email\Email;
+use MailHebrew\Domain\Email\EmailSender as EmailSenderInterface;
 use PHPMailer\PHPMailer\PHPMailer;
 use PHPMailer\PHPMailer\Exception;
 use Psr\Log\LoggerInterface;
 use MailHebrew\Infrastructure\Tracking\TrackingManager;
 
-class EmailSender
+class EmailSender implements EmailSenderInterface
 {
     private array $smtpConfig;
     private LoggerInterface $logger;

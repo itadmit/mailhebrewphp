@@ -12,8 +12,8 @@ class Email
     private string $id;
     private string $from;
     private string $fromName;
-    private string $to;
-    private ?string $toName;
+    private array $to;
+    private array $toNames;
     private string $subject;
     private ?string $contentHtml;
     private ?string $contentText;
@@ -24,12 +24,17 @@ class Email
     private ?DateTimeImmutable $openedAt;
     private ?DateTimeImmutable $clickedAt;
     private array $metadata;
+    private array $cc;
+    private array $bcc;
+    private array $attachments;
+    private array $headers;
+    private array $tags;
 
     public function __construct(
         string $from,
         string $fromName,
-        string $to,
-        ?string $toName = null,
+        $to,
+        $toName = null,
         string $subject = '',
         ?string $contentHtml = null,
         ?string $contentText = null,
@@ -39,8 +44,8 @@ class Email
         $this->id = Uuid::uuid4()->toString();
         $this->from = $from;
         $this->fromName = $fromName;
-        $this->to = $to;
-        $this->toName = $toName;
+        $this->to = is_array($to) ? $to : [$to];
+        $this->toNames = is_array($toName) ? $toName : [$toName];
         $this->subject = $subject;
         $this->contentHtml = $contentHtml;
         $this->contentText = $contentText;
@@ -51,6 +56,11 @@ class Email
         $this->openedAt = null;
         $this->clickedAt = null;
         $this->metadata = [];
+        $this->cc = [];
+        $this->bcc = [];
+        $this->attachments = [];
+        $this->headers = [];
+        $this->tags = [];
     }
 
     public function getId(): string
@@ -68,14 +78,21 @@ class Email
         return $this->fromName;
     }
 
-    public function getTo(): string
+    public function getTo(): array
     {
-        return $this->to;
+        $recipients = [];
+        foreach ($this->to as $index => $email) {
+            $recipients[] = [
+                'email' => $email,
+                'name' => $this->toNames[$index] ?? null
+            ];
+        }
+        return $recipients;
     }
 
     public function getToName(): ?string
     {
-        return $this->toName;
+        return $this->toNames[0] ?? null;
     }
 
     public function getSubject(): string
@@ -160,5 +177,80 @@ class Email
                !empty($this->to) &&
                !empty($this->subject) &&
                (!empty($this->contentHtml) || !empty($this->contentText));
+    }
+
+    public function getHtmlBody(): ?string
+    {
+        return $this->contentHtml;
+    }
+
+    public function getTextBody(): ?string
+    {
+        return $this->contentText;
+    }
+
+    public function getCc(): array
+    {
+        return $this->cc;
+    }
+
+    public function addCc(string $email, ?string $name = null): void
+    {
+        $this->cc[] = ['email' => $email, 'name' => $name];
+    }
+
+    public function getBcc(): array
+    {
+        return $this->bcc;
+    }
+
+    public function addBcc(string $email, ?string $name = null): void
+    {
+        $this->bcc[] = ['email' => $email, 'name' => $name];
+    }
+
+    public function getAttachments(): array
+    {
+        return $this->attachments;
+    }
+
+    public function addAttachment(string $path, ?string $name = null): void
+    {
+        $this->attachments[] = ['path' => $path, 'name' => $name];
+    }
+
+    public function getHeaders(): array
+    {
+        return $this->headers;
+    }
+
+    public function addHeader(string $name, string $value): void
+    {
+        $this->headers[$name] = $value;
+    }
+
+    public function getTags(): array
+    {
+        return $this->tags;
+    }
+
+    public function addTag(string $tag): void
+    {
+        $this->tags[] = $tag;
+    }
+
+    public function isTrackOpens(): bool
+    {
+        return $this->trackingEnabled;
+    }
+
+    public function isTrackClicks(): bool
+    {
+        return $this->trackingEnabled;
+    }
+
+    public function incrementSendAttempts(): void
+    {
+        // TODO: Implement send attempts tracking
     }
 } 

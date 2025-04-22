@@ -177,7 +177,7 @@ $containerBuilder->addDefinitions([
             $logger
         );
     },
-    \MailHebrew\Infrastructure\Mail\EmailSender::class => function (ContainerInterface $c) {
+    \MailHebrew\Domain\Email\EmailSender::class => function (ContainerInterface $c) {
         $smtpConfig = $c->get('settings')['smtp'];
         $logger = $c->get('logger');
         $trackingManager = $c->get(\MailHebrew\Infrastructure\Tracking\TrackingManager::class);
