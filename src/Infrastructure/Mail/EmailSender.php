@@ -29,116 +29,118 @@ class EmailSender implements EmailSenderInterface
 
     public function send(Email $email): bool
     {
-        $mail = $this->createMailer();
-        
+        $this->logger->info('Starting email send process', [
+            'email_id' => $email->getId(),
+            'to' => $email->getTo(),
+            'subject' => $email->getSubject()
+        ]);
+
         try {
+            $mail = new PHPMailer(true);
+            
+            $this->logger->info('Configuring SMTP settings', [
+                'host' => $this->smtpConfig['host'],
+                'port' => $this->smtpConfig['port'],
+                'username' => $this->smtpConfig['username']
+            ]);
+
+            // הגדרת SMTP
+            $mail->isSMTP();
+            $mail->Host = $this->smtpConfig['host'];
+            $mail->SMTPAuth = true;
+            $mail->Username = $this->smtpConfig['username'];
+            $mail->Password = $this->smtpConfig['password'];
+            $mail->SMTPSecure = PHPMailer::ENCRYPTION_STARTTLS;
+            $mail->Port = $this->smtpConfig['port'];
+            $mail->CharSet = 'UTF-8';
+
             // הגדרת השולח
             $mail->setFrom($email->getFrom(), $email->getFromName());
             
-            // הגדרת הנמענים
+            $this->logger->info('Setting recipients', [
+                'to' => $email->getTo(),
+                'cc' => $email->getCc(),
+                'bcc' => $email->getBcc()
+            ]);
+
+            // הגדרת נמענים
             foreach ($email->getTo() as $recipient) {
-                if (is_array($recipient)) {
-                    $mail->addAddress($recipient['email'], $recipient['name'] ?? '');
-                } else {
-                    $mail->addAddress($recipient);
-                }
+                $mail->addAddress($recipient['email'], $recipient['name'] ?? '');
             }
-            
+
             // הגדרת CC
             foreach ($email->getCc() as $cc) {
-                if (is_array($cc)) {
-                    $mail->addCC($cc['email'], $cc['name'] ?? '');
-                } else {
-                    $mail->addCC($cc);
-                }
+                $mail->addCC($cc['email'], $cc['name'] ?? '');
             }
-            
+
             // הגדרת BCC
             foreach ($email->getBcc() as $bcc) {
-                if (is_array($bcc)) {
-                    $mail->addBCC($bcc['email'], $bcc['name'] ?? '');
-                } else {
-                    $mail->addBCC($bcc);
-                }
+                $mail->addBCC($bcc['email'], $bcc['name'] ?? '');
             }
-            
-            // הגדרת כותרת
+
+            // הגדרת נושא ותוכן
             $mail->Subject = $email->getSubject();
             
-            // הכנת תוכן ההודעה עם מעקב פתיחות והקלקות
-            $htmlContent = $email->getHtmlBody();
-            $textContent = $email->getTextBody();
-            
-            // הוספת מעקב פתיחות
-            if ($email->isTrackOpens()) {
+            $this->logger->info('Processing email content', [
+                'has_html' => !empty($email->getContentHtml()),
+                'has_text' => !empty($email->getContentText())
+            ]);
+
+            // עיבוד תוכן HTML
+            $htmlContent = $email->getContentHtml();
+            if ($email->isTrackingEnabled()) {
+                $this->logger->info('Adding tracking to HTML content');
                 $htmlContent = $this->trackingManager->addOpenTracking($htmlContent, $email->getId());
-            }
-            
-            // הוספת מעקב הקלקות
-            if ($email->isTrackClicks()) {
                 $htmlContent = $this->trackingManager->addClickTracking($htmlContent, $email->getId());
             }
-            
-            // הוספת קישור להסרה מרשימת תפוצה
-            $htmlContent = $this->trackingManager->addUnsubscribeLink($htmlContent, $email->getId());
-            $textContent = $this->trackingManager->addUnsubscribeText($textContent, $email->getId());
-            
-            // הגדרת גוף ההודעה
+
             $mail->isHTML(true);
             $mail->Body = $htmlContent;
-            $mail->AltBody = $textContent;
-            
+            $mail->AltBody = $email->getContentText();
+
             // הוספת קבצים מצורפים
-            foreach ($email->getAttachments() as $attachment) {
-                $mail->addAttachment($attachment['path'], $attachment['name'] ?? '');
-            }
-            
-            // הוספת כותרות (headers) מותאמות אישית
-            foreach ($email->getHeaders() as $name => $value) {
-                $mail->addCustomHeader($name, $value);
-            }
-            
-            // הוספת Message-ID ייחודי
-            $mail->MessageID = '<' . $email->getId() . '@' . parse_url($this->smtpConfig['from_email'], PHP_URL_HOST) . '>';
-            
-            // הוספת תגיות כחלק מה-X-Headers
-            if (!empty($email->getTags())) {
-                $mail->addCustomHeader('X-Tags', implode(', ', $email->getTags()));
-            }
-            
-            // שליחת האימייל
-            $result = $mail->send();
-            
-            if ($result) {
-                $email->setStatus(Email::STATUS_SENT);
-                $this->logger->info('Email sent successfully', [
-                    'email_id' => $email->getId(),
-                    'to' => $email->getTo(),
-                    'subject' => $email->getSubject(),
+            if (!empty($email->getAttachments())) {
+                $this->logger->info('Adding attachments', [
+                    'count' => count($email->getAttachments())
                 ]);
-                
+                foreach ($email->getAttachments() as $attachment) {
+                    $mail->addAttachment($attachment['path'], $attachment['name'] ?? '');
+                }
+            }
+
+            // הוספת headers מותאמים אישית
+            if (!empty($email->getHeaders())) {
+                $this->logger->info('Adding custom headers', [
+                    'headers' => $email->getHeaders()
+                ]);
+                foreach ($email->getHeaders() as $name => $value) {
+                    $mail->addCustomHeader($name, $value);
+                }
+            }
+
+            $this->logger->info('Sending email');
+            $result = $mail->send();
+
+            if ($result) {
+                $this->logger->info('Email sent successfully', [
+                    'email_id' => $email->getId()
+                ]);
                 return true;
             } else {
-                $email->setStatus(Email::STATUS_FAILED);
                 $this->logger->error('Failed to send email', [
                     'email_id' => $email->getId(),
-                    'error' => $mail->ErrorInfo,
+                    'error' => $mail->ErrorInfo
                 ]);
-                
                 return false;
             }
-        } catch (Exception $e) {
-            $email->setStatus(Email::STATUS_FAILED);
+
+        } catch (\Exception $e) {
             $this->logger->error('Exception while sending email', [
                 'email_id' => $email->getId(),
-                'exception' => $e->getMessage(),
-                'trace' => $e->getTraceAsString(),
+                'error' => $e->getMessage(),
+                'trace' => $e->getTraceAsString()
             ]);
-            
             return false;
-        } finally {
-            // עדכון ניסיון שליחה
-            $email->incrementSendAttempts();
         }
     }
 

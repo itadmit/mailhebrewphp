@@ -38,56 +38,73 @@ class EmailController
      */
     public function send(Request $request, Response $response): Response
     {
-        $data = $request->getParsedBody();
-        
-        // וידוא שדות חובה
-        if (!$this->validateRequiredEmailFields($data)) {
-            return $this->jsonResponse($response, [
-                'success' => false,
-                'message' => 'Missing required fields',
-            ], 400);
-        }
-        
+        $this->logger->info('Received email send request', [
+            'body' => $request->getParsedBody()
+        ]);
+
         try {
-            // מזהה החשבון (בפועל יתקבל מה-authentication)
-            $accountId = $data['account_id'] ?? 1;
+            $data = $request->getParsedBody();
+            
+            $this->logger->info('Validating request data');
+            
+            // בדיקת שדות חובה
+            if (empty($data['to_email'])) {
+                $this->logger->error('Missing required field: to_email');
+                return $this->jsonResponse($response, ['error' => 'Missing required field: to_email'], 400);
+            }
+
+            if (empty($data['subject'])) {
+                $this->logger->error('Missing required field: subject');
+                return $this->jsonResponse($response, ['error' => 'Missing required field: subject'], 400);
+            }
+
+            if (empty($data['content_html']) && empty($data['content_text'])) {
+                $this->logger->error('Missing required field: content_html or content_text');
+                return $this->jsonResponse($response, ['error' => 'Missing required field: content_html or content_text'], 400);
+            }
+
+            $this->logger->info('Creating email object');
             
             // יצירת אובייקט אימייל
-            $email = new Email(
-                $data['from_email'],
-                $data['from_name'],
-                $data['to_email'],
-                $data['to_name'] ?? null,
-                $data['subject'],
-                $data['content_html'] ?? null,
-                $data['content_text'] ?? null,
-                $data['reply_to'] ?? null,
-                $data['tracking_enabled'] ?? true
-            );
-            
-            // שמירה למסד הנתונים
-            $this->saveEmailToDatabase($email, $accountId);
-            
-            // הוספה לתור
-            $this->queueManager->enqueue($email);
-            
-            return $this->jsonResponse($response, [
-                'success' => true,
-                'message' => 'Email queued successfully',
-                'email_id' => $email->getId(),
+            $email = new Email();
+            $email->setTo([
+                [
+                    'email' => $data['to_email'],
+                    'name' => $data['to_name'] ?? null
+                ]
             ]);
-            
+            $email->setSubject($data['subject']);
+            $email->setFrom($data['from_email'] ?? 'no-reply@quick-site.co.il');
+            $email->setFromName($data['from_name'] ?? 'MailHebrew System');
+            $email->setContentHtml($data['content_html'] ?? '');
+            $email->setContentText($data['content_text'] ?? '');
+            $email->setReplyTo($data['reply_to'] ?? null);
+            $email->setTrackingEnabled($data['tracking_enabled'] ?? true);
+
+            $this->logger->info('Email object created', [
+                'to' => $email->getTo(),
+                'subject' => $email->getSubject(),
+                'from' => $email->getFrom()
+            ]);
+
+            // שליחת האימייל
+            $this->logger->info('Sending email');
+            $result = $this->emailSender->send($email);
+
+            if ($result) {
+                $this->logger->info('Email sent successfully');
+                return $this->jsonResponse($response, ['message' => 'Email sent successfully']);
+            } else {
+                $this->logger->error('Failed to send email');
+                return $this->jsonResponse($response, ['error' => 'Failed to send email'], 500);
+            }
+
         } catch (\Exception $e) {
-            $this->logger->error('Failed to queue email', [
+            $this->logger->error('Exception while processing email request', [
                 'error' => $e->getMessage(),
-                'trace' => $e->getTraceAsString(),
+                'trace' => $e->getTraceAsString()
             ]);
-            
-            return $this->jsonResponse($response, [
-                'success' => false,
-                'message' => 'Failed to queue email',
-                'error' => $e->getMessage(),
-            ], 500);
+            return $this->jsonResponse($response, ['error' => 'Internal server error'], 500);
         }
     }
 
